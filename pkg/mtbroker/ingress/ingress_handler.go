@@ -44,27 +44,61 @@ import (
 const (
 	// noDuration signals that the dispatch step hasn't started
 	noDuration = -1
+
+	// TODO make these constants configurable (either as env variables, config map, or part of broker spec).
+	//  Issue: https://github.com/knative/eventing/issues/1777
+	// Constants for the underlying HTTP Client transport. These would enable better connection reuse.
+	// Purposely set them to be equal, as the ingress only connects to its channel.
+	// These are magic numbers, partly set based on empirical evidence running performance workloads, and partly
+	// based on what serving is doing. See https://github.com/knative/serving/blob/master/pkg/network/transports.go.
+	defaultMaxIdleConnections        = 1000
+	defaultMaxIdleConnectionsPerHost = 1000
 )
 
+// Handler parses Cloud Events, determines if they pass a filter, and sends them to a subscriber.
 type Handler struct {
-	// Receiver receives incoming HTTP requests
-	Receiver *kncloudevents.HttpMessageReceiver
-	// Sender sends requests to the broker
-	Sender *kncloudevents.HttpMessageSender
-	// Defaults sets default values to incoming events
-	Defaulter client.EventDefaulter
-	// Reporter reports stats of status code and dispatch time
-	Reporter StatsReporter
-	// BrokerLister gets broker objects
-	BrokerLister eventinglisters.BrokerLister
+	// receiver receives incoming HTTP requests
+	receiver *kncloudevents.HttpMessageReceiver
+	// sender sends requests to the broker
+	sender *kncloudevents.HttpMessageSender
+	// defaulter sets default values to incoming events
+	defaulter client.EventDefaulter
+	// reporter reports stats of status code and dispatch time
+	reporter StatsReporter
+	// brokerLister gets broker objects
+	brokerLister eventinglisters.BrokerLister
 
-	Logger *zap.Logger
+	logger *zap.Logger
+}
+
+// NewHandler creates a new Handler and its associated MessageReceiver. The caller is responsible for
+// Start()ing the returned Handler.
+func NewHandler(logger *zap.Logger, brokerLister eventinglisters.BrokerLister, reporter StatsReporter, defaulter client.EventDefaulter, port int) (*Handler, error) {
+
+	connectionArgs := kncloudevents.ConnectionArgs{
+		MaxIdleConns:        defaultMaxIdleConnections,
+		MaxIdleConnsPerHost: defaultMaxIdleConnectionsPerHost,
+	}
+
+	sender, err := kncloudevents.NewHttpMessageSender(&connectionArgs, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create message sender: %w", err)
+	}
+
+	return &Handler{
+		receiver:     kncloudevents.NewHttpMessageReceiver(port),
+		sender:       sender,
+		defaulter:    defaulter,
+		reporter:     reporter,
+		logger:       logger,
+		brokerLister: brokerLister,
+	}, nil
 }
 
 func (h *Handler) getBroker(name, namespace string) (*eventingv1.Broker, error) {
-	broker, err := h.BrokerLister.Brokers(namespace).Get(name)
+	broker, err := h.brokerLister.Brokers(namespace).Get(name)
 	if err != nil {
-		h.Logger.Warn("Broker getter failed")
+		h.logger.Warn("Broker getter failed")
 		return nil, err
 	}
 	return broker, nil
@@ -94,14 +128,24 @@ func (h *Handler) getChannelAddress(name, namespace string) (string, error) {
 	return address, nil
 }
 
+// Start begins to receive messages for the handler.
+//
+// HTTP POST requests to the root path (/) are accepted.
+//
+// This method will block until ctx is done.
 func (h *Handler) Start(ctx context.Context) error {
-	return h.Receiver.StartListen(ctx, health.WithLivenessCheck(h))
+	return h.receiver.StartListen(ctx, health.WithLivenessCheck(h))
 }
 
+// 1. validate request
+// 2. extract event from request
+// 3. get broker from its broker reference extracted from the request URI
+// 4. send event to channel address in broker annotation
+// 5. write the response
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// validate request method
 	if request.Method != http.MethodPost {
-		h.Logger.Warn("unexpected request method", zap.String("method", request.Method))
+		h.logger.Warn("unexpected request method", zap.String("method", request.Method))
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -113,7 +157,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	nsBrokerName := strings.Split(request.RequestURI, "/")
 	if len(nsBrokerName) != 3 {
-		h.Logger.Info("Malformed uri", zap.String("URI", request.RequestURI))
+		h.logger.Info("Malformed uri", zap.String("URI", request.RequestURI))
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -125,7 +169,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 	event, err := binding.ToEvent(ctx, message)
 	if err != nil {
-		h.Logger.Warn("failed to extract event from request", zap.Error(err))
+		h.logger.Warn("failed to extract event from request", zap.Error(err))
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -158,9 +202,9 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 	statusCode, dispatchTime := h.receive(ctx, request.Header, event, brokerNamespace, brokerName)
 	if dispatchTime > noDuration {
-		_ = h.Reporter.ReportEventDispatchTime(reporterArgs, statusCode, dispatchTime)
+		_ = h.reporter.ReportEventDispatchTime(reporterArgs, statusCode, dispatchTime)
 	}
-	_ = h.Reporter.ReportEventCount(reporterArgs, statusCode)
+	_ = h.reporter.ReportEventCount(reporterArgs, statusCode)
 
 	writer.WriteHeader(statusCode)
 }
@@ -169,19 +213,19 @@ func (h *Handler) receive(ctx context.Context, headers http.Header, event *cloud
 
 	// Setting the extension as a string as the CloudEvents sdk does not support non-string extensions.
 	event.SetExtension(broker.EventArrivalTime, cloudevents.Timestamp{Time: time.Now()})
-	if h.Defaulter != nil {
-		newEvent := h.Defaulter(ctx, *event)
+	if h.defaulter != nil {
+		newEvent := h.defaulter(ctx, *event)
 		event = &newEvent
 	}
 
 	if ttl, err := broker.GetTTL(event.Context); err != nil || ttl <= 0 {
-		h.Logger.Debug("dropping event based on TTL status.", zap.Int32("TTL", ttl), zap.String("event.id", event.ID()), zap.Error(err))
+		h.logger.Debug("dropping event based on TTL status.", zap.Int32("TTL", ttl), zap.String("event.id", event.ID()), zap.Error(err))
 		return http.StatusBadRequest, noDuration
 	}
 
 	channelAddress, err := h.getChannelAddress(brokerName, brokerNamespace)
 	if err != nil {
-		h.Logger.Warn("Failed to get channel address, falling back on guess", zap.Error(err))
+		h.logger.Warn("Failed to get channel address, falling back on guess", zap.Error(err))
 		channelAddress = guessChannelAddress(brokerName, brokerNamespace, utils.GetClusterDomainName())
 	}
 
@@ -190,7 +234,7 @@ func (h *Handler) receive(ctx context.Context, headers http.Header, event *cloud
 
 func (h *Handler) send(ctx context.Context, headers http.Header, event *cloudevents.Event, target string) (int, time.Duration) {
 
-	request, err := h.Sender.NewCloudEventRequestWithTarget(ctx, target)
+	request, err := h.sender.NewCloudEventRequestWithTarget(ctx, target)
 	if err != nil {
 		return http.StatusInternalServerError, noDuration
 	}
@@ -217,7 +261,7 @@ func (h *Handler) send(ctx context.Context, headers http.Header, event *cloudeve
 
 func (h *Handler) sendAndRecordDispatchTime(request *http.Request) (*http.Response, time.Duration, error) {
 	start := time.Now()
-	resp, err := h.Sender.Send(request)
+	resp, err := h.sender.Send(request)
 	dispatchTime := time.Since(start)
 	return resp, dispatchTime, err
 }

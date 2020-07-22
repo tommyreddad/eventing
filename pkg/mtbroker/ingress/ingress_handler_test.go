@@ -24,8 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"knative.dev/eventing/pkg/kncloudevents"
-
 	"github.com/cloudevents/sdk-go/v2/client"
 	"github.com/cloudevents/sdk-go/v2/event"
 	cehttp "github.com/cloudevents/sdk-go/v2/protocol/http"
@@ -212,13 +210,9 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				annotatedBrokers = append(annotatedBrokers, b)
 			}
 			listers := reconcilertestingv1.NewListers(annotatedBrokers)
-			sender, _ := kncloudevents.NewHttpMessageSender(nil, "")
-			h := &Handler{
-				Sender:       sender,
-				Defaulter:    tc.defaulter,
-				Reporter:     &mockReporter{},
-				Logger:       logger,
-				BrokerLister: listers.GetBrokerLister(),
+			h, err := NewHandler(logger, listers.GetBrokerLister(), &mockReporter{}, tc.defaulter, 8080)
+			if err != nil {
+				t.Fatalf("Unable to create handler: %v", err)
 			}
 
 			h.ServeHTTP(recorder, request)
@@ -238,8 +232,8 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				}
 			}
 
-			if diff := cmp.Diff(tc.reporter, h.Reporter); diff != "" {
-				t.Errorf("expected reporter state %+v got %+v - diff %s", tc.reporter, h.Reporter, diff)
+			if diff := cmp.Diff(tc.reporter, h.reporter); diff != "" {
+				t.Errorf("expected reporter state %+v got %+v - diff %s", tc.reporter, h.reporter, diff)
 			}
 		})
 	}

@@ -32,7 +32,6 @@ import (
 
 	cmdbroker "knative.dev/eventing/cmd/mtbroker"
 	brokerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/broker"
-	"knative.dev/eventing/pkg/kncloudevents"
 	broker "knative.dev/eventing/pkg/mtbroker"
 	"knative.dev/eventing/pkg/mtbroker/ingress"
 	"knative.dev/eventing/pkg/reconciler/names"
@@ -58,15 +57,9 @@ var (
 // TODO make these constants configurable (either as env variables, config map, or part of broker spec).
 //  Issue: https://github.com/knative/eventing/issues/1777
 const (
-	// Constants for the underlying HTTP Client transport. These would enable better connection reuse.
-	// Purposely set them to be equal, as the ingress only connects to its channel.
-	// These are magic numbers, partly set based on empirical evidence running performance workloads, and partly
-	// based on what serving is doing. See https://github.com/knative/serving/blob/master/pkg/network/transports.go.
-	defaultMaxIdleConnections              = 1000
-	defaultMaxIdleConnectionsPerHost       = 1000
-	defaultTTL                       int32 = 255
-	defaultMetricsPort                     = 9092
-	component                              = "mt_broker_ingress"
+	defaultTTL         int32 = 255
+	defaultMetricsPort       = 9092
+	component                = "mt_broker_ingress"
 )
 
 type envConfig struct {
@@ -113,8 +106,6 @@ func main() {
 
 	logger.Info("Starting the Broker Ingress")
 
-	brokerLister := brokerinformer.Get(ctx).Lister()
-
 	// Watch the logging config map and dynamically update logging levels.
 	configMapWatcher := configmap.NewInformedWatcher(kubeclient.Get(ctx), system.Namespace())
 	// Watch the observability config map and dynamically update metrics exporter.
@@ -135,24 +126,13 @@ func main() {
 		logger.Fatal("Error setting up trace publishing", zap.Error(err))
 	}
 
-	connectionArgs := kncloudevents.ConnectionArgs{
-		MaxIdleConns:        defaultMaxIdleConnections,
-		MaxIdleConnsPerHost: defaultMaxIdleConnectionsPerHost,
-	}
-	sender, err := kncloudevents.NewHttpMessageSender(&connectionArgs, "")
-	if err != nil {
-		logger.Fatal("Unable to create message sender", zap.Error(err))
-	}
-
+	brokerInformer := brokerinformer.Get(ctx)
 	reporter := ingress.NewStatsReporter(env.ContainerName, kmeta.ChildName(env.PodName, uuid.New().String()))
+	defaulter := broker.TTLDefaulter(logger, defaultTTL)
 
-	h := &ingress.Handler{
-		Receiver:     kncloudevents.NewHttpMessageReceiver(env.Port),
-		Sender:       sender,
-		Defaulter:    broker.TTLDefaulter(logger, defaultTTL),
-		Reporter:     reporter,
-		Logger:       logger,
-		BrokerLister: brokerLister,
+	handler, err := ingress.NewHandler(logger, brokerInformer.Lister(), reporter, defaulter, env.Port)
+	if err != nil {
+		logger.Fatal("Error creating Handler", zap.Error(err))
 	}
 
 	// configMapWatcher does not block, so start it first.
@@ -167,7 +147,7 @@ func main() {
 	}
 
 	// Start blocks forever.
-	if err = h.Start(ctx); err != nil {
+	if err = handler.Start(ctx); err != nil {
 		logger.Error("ingress.Start() returned an error", zap.Error(err))
 	}
 	logger.Info("Exiting...")

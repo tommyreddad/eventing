@@ -65,9 +65,10 @@ type Handler struct {
 	sender *kncloudevents.HttpMessageSender
 	// reporter reports stats of status code and dispatch time
 	reporter StatsReporter
-
+	// triggerLister gets trigger objects
 	triggerLister eventinglisters.TriggerLister
-	logger        *zap.Logger
+
+	logger *zap.Logger
 }
 
 // FilterResult has the result of the filtering operation.
@@ -114,6 +115,7 @@ func (h *Handler) Start(ctx context.Context) error {
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 	if request.Method != http.MethodPost {
+		h.logger.Warn("unexpected request method", zap.String("method", request.Method))
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
